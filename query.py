@@ -1,4 +1,3 @@
-from collections import defaultdict
 from dataclasses import dataclass
 
 
@@ -10,58 +9,68 @@ class frozendict(dict):
 @dataclass(frozen=True)
 class QueryNode:
     name: str
-    args: tuple
+    source: None
     kwargs: frozendict
 
+    def _child(self, name, **kwargs):
+        return QueryNode(name=name, source=self, kwargs=frozendict(kwargs))
 
-def make_method(name):
-    def fn(self, *args, **kwargs):
-        kwargs["source"] = self
-        return QueryNode(name, args, frozendict(kwargs))
+    def get(self, column):
+        return self._child("get", column=column)
 
-    return fn
+    def filter(self, *args, **kwargs):
+        if not args:
+            assert kwargs
+            node = self
+            for field, value in kwargs.items():
+                node = node.filter(field, equals=value)
+            return node
+        elif len(kwargs) > 1:
+            node = self
+            for operator, value in kwargs.items():
+                node = node.filter(*args, **{operator: value})
+            return node
+        assert len(args) == 1
+        operator, value = list(kwargs.items())[0]
+        if operator == "between":
+            return self.filter(*args, on_or_after=value[0], on_or_before=value[1])
+        translations = {
+            "equals": "__eq__",
+            "less_than": "__lt__",
+            "less_than_or_equals": "__le__",
+            "greater_than": "__gt__",
+            "greater_than_or_equals": "__ge__",
+            "on_or_before": "__le__",
+            "on_or_after": "__ge__",
+        }
+        operator = translations[operator]
+        return self._child("filter", column=args[0], operator=operator, value=value)
 
+    def earliest(self, *args):
+        return self.first_by("date")
 
-METHODS = ["filter", "get", "earliest"]
-for method in METHODS:
-    setattr(QueryNode, method, make_method(method))
+    def latest(self, *args):
+        return self.last_by("date")
+
+    def first_by(self, *columns):
+        assert columns
+        return self._child("order", direction="desc", columns=columns)
+
+    def last_by(self, *columns):
+        assert columns
+        return self._child("order", direction="asc", columns=columns)
+
+    def active_as_of(self, date):
+        return (
+            self.filter("date_start", greater_than_or_equals=date)
+            .filter("date_end", less_than_or_equals=date)
+            .last_by("date_start", "date_end")
+        )
 
 
 def table(table_name):
-    return QueryNode(name="table", args=(table_name,), kwargs=frozendict())
+    return QueryNode(name="table", source=None, kwargs=frozendict(table_name=table_name))
 
 
-def build_sql(cohort_class):
-    cohort_vars = get_class_vars(cohort_class)
-    queries = defaultdict(set)
-    for output_column, query_node in cohort_vars.items():
-        recurse_query_tree(query_node, queries)
-    print(queries)
-
-
-def get_class_vars(cls):
-    default_vars = set(dir(type("", (), {})))
-    return {key: value for key, value in vars(cls).items() if key not in default_vars}
-
-
-def recurse_query_tree(query_node, queries):
-    if query_node.name == "get":
-        column = query_node.args[0]
-        queries[query_node.kwargs["source"]].add(column)
-    else:
-        all_args = query_node.args + tuple(query_node.kwargs.values())
-        children = [arg for arg in all_args if isinstance(arg, QueryNode)]
-        for child in children:
-            recurse_query_tree(child, queries)
-
-
-class my_cohort:
-    has_drug_x = (
-        table("medications")
-        .filter("date", on_or_before="2020-01-01")
-        .earliest()
-        .get("code")
-    )
-
-
-build_sql(my_cohort)
+def codelist(*args, **kwargs):
+    pass
