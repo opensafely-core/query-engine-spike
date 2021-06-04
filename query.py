@@ -1,24 +1,24 @@
-from dataclasses import dataclass
+def table(table_name):
+    return BaseTable(table_name)
 
 
-class frozendict(dict):
-    def __hash__(self):
-        return id(self)
+def codelist(*args, **kwargs):
+    pass
 
 
-@dataclass(frozen=True)
 class QueryNode:
-    name: str
-    source: None
-    kwargs: frozendict
+    pass
 
-    def _child(self, name, **kwargs):
-        return QueryNode(name=name, source=self, kwargs=frozendict(kwargs))
+
+class BaseTable(QueryNode):
+    def __init__(self, name):
+        self.name = name
 
     def get(self, column):
-        return self._child("get", column=column)
+        return Column(source=self, column=column)
 
     def filter(self, *args, **kwargs):
+        # Syntactic suger
         if not args:
             assert kwargs
             node = self
@@ -34,6 +34,7 @@ class QueryNode:
         operator, value = list(kwargs.items())[0]
         if operator == "between":
             return self.filter(*args, on_or_after=value[0], on_or_before=value[1])
+
         translations = {
             "equals": "__eq__",
             "less_than": "__lt__",
@@ -44,7 +45,9 @@ class QueryNode:
             "on_or_after": "__ge__",
         }
         operator = translations[operator]
-        return self._child("filter", column=args[0], operator=operator, value=value)
+        return FilteredTable(
+            source=self, column=args[0], operator=operator, value=value
+        )
 
     def earliest(self, *args):
         return self.first_by("date")
@@ -54,11 +57,11 @@ class QueryNode:
 
     def first_by(self, *columns):
         assert columns
-        return self._child("order", direction="desc", columns=columns)
+        return RowFromOrderBy(source=self, sort_columns=columns, descending=True)
 
     def last_by(self, *columns):
         assert columns
-        return self._child("order", direction="asc", columns=columns)
+        return RowFromOrderBy(source=self, sort_columns=columns, descending=False)
 
     def active_as_of(self, date):
         return (
@@ -67,10 +70,47 @@ class QueryNode:
             .last_by("date_start", "date_end")
         )
 
+    def count(self):
+        return self.aggregate("COUNT", "*")
 
-def table(table_name):
-    return QueryNode(name="table", source=None, kwargs=frozendict(table_name=table_name))
+    def aggregate(self, function, column):
+        return RowFromAggregate(self, function, column)
 
 
-def codelist(*args, **kwargs):
-    pass
+class FilteredTable(BaseTable):
+    def __init__(self, source, column, operator, value):
+        self.source = source
+        self.column = column
+        self.operator = operator
+        self.value = value
+
+
+class Row(QueryNode):
+    def get(self, column):
+        return Value(source=self, column=column)
+
+
+class RowFromOrderBy(Row):
+    def __init__(self, source, sort_columns, descending=False):
+        self.source = source
+        self.sort_columns = sort_columns
+        self.descending = descending
+
+
+class RowFromAggregate(Row):
+    def __init__(self, source, function, column):
+        self.source = source
+        self.function = function
+        self.column = column
+
+
+class Column(QueryNode):
+    def __init__(self, source, column):
+        self.source = source
+        self.column = column
+
+
+class Value(QueryNode):
+    def __init__(self, source, column):
+        self.source = source
+        self.column = column
