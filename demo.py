@@ -1,9 +1,16 @@
 from collections import defaultdict
-import textwrap
 
 import sqlalchemy
 
-from query import QueryNode, Value, BaseTable, FilteredTable, RowFromOrderBy
+from query import (
+    QueryNode,
+    ValueFromRow,
+    ValueFromAggregate,
+    Column,
+    BaseTable,
+    FilteredTable,
+    Row,
+)
 
 
 def _next_table_name():
@@ -27,32 +34,44 @@ def main():
 
 
 def build_queries(cohort):
-    columns_by_query = defaultdict(set)
-    for query_node in cohort.values():
-        recurse_query_tree(query_node, columns_by_query)
-    for query, columns in columns_by_query.items():
-        table = table_names[query]
-        query_sql = get_query_sql(query, columns)
-        query_sql = textwrap.indent(query_sql, "  ")
-        yield f"SELECT * INTO {table} FROM (\n{query_sql}\n) t"
-    output_cols = [f"  {list(table_names.values())[0]}.patient_id AS patient_id"]
-    for output_column, query in cohort.items():
-        table = table_names[query.source]
-        column = query.column
-        output_cols.append(f"  {table}.{column} AS {output_column}")
-    output_sql = ["SELECT"]
-    output_sql.append(",\n".join(output_cols))
-    output_sql.append("FROM")
-    tables = [table_names[query] for query in columns_by_query]
-    primary_table = tables.pop(0)
-    output_sql.append(f"  {primary_table}")
-    output_sql.extend(
-        [
-            f"  LEFT JOIN {table} ON {primary_table}.patient_id = {table}.patient_id"
-            for table in tables
-        ]
+    queries = get_queries(cohort.values())
+    tables = {}
+    for n, (query, columns) in enumerate(queries.items()):
+        if isinstance(query, ValueFromAggregate):
+            columns = {"value"}
+        table_name = f"#table_{n}"
+        table = get_sqlalchemy_table(table_name, columns)
+        tables[query] = table
+    sql = []
+    for query, columns in queries.items():
+        query_expr = get_query_expr(query, columns, tables)
+        query_sql = query_to_sql(query_expr)
+        temp_table = tables[query].name
+        sql.append(
+            f"SELECT * INTO {temp_table} FROM (\n{query_sql}\n) t"
+        )
+    population = cohort.pop("population")
+    column, table = get_value_expr(population, tables)
+    query = sqlalchemy.select([table.c.patient_id.label("patient_id")]).select_from(table).where(column == True)
+    for column_name, node in cohort.items():
+        column, table = get_value_expr(node, tables)
+        query = include_joined_table(query, table)
+        query = query.add_columns(column.label(column_name))
+    sql.append(query_to_sql(query))
+    return sql
+
+
+def query_to_sql(query):
+    return str(query.compile(compile_kwargs={"literal_binds": True}))
+
+
+def get_sqlalchemy_table(table_name, columns):
+    return sqlalchemy.Table(
+        table_name,
+        sqlalchemy.MetaData(),
+        sqlalchemy.Column("patient_id"),
+        *[sqlalchemy.Column(column) for column in columns],
     )
-    yield "\n".join(output_sql)
 
 
 def get_class_vars(cls):
@@ -60,25 +79,50 @@ def get_class_vars(cls):
     return [(key, value) for key, value in vars(cls).items() if key not in default_vars]
 
 
-def recurse_query_tree(query_node, columns_by_query):
-    if isinstance(query_node, Value):
-        source_query = query_node.source
-        column_name = query_node.column
-        columns_by_query[source_query].add(column_name)
-    else:
-        children = []
+def get_queries(leaf_nodes):
+    queries = defaultdict(set)
+    for node in walk_tree(leaf_nodes):
+        if isinstance(node, (ValueFromRow, Column)):
+            queries[node.source].add(node.column)
+        elif isinstance(node, ValueFromAggregate):
+            queries[node].add(node.column)
+    return queries
+
+
+def walk_tree(nodes):
+    parents = []
+    for node in nodes:
+        yield node
         for attr in ("source", "value"):
-            value = getattr(query_node, attr, None)
-            if isinstance(value, QueryNode):
-                children.append(value)
-        for child in children:
-            recurse_query_tree(child, columns_by_query)
+            reference = getattr(node, attr, None)
+            if isinstance(reference, QueryNode):
+                parents.append(reference)
+    if parents:
+        yield from walk_tree(parents)
 
 
-def get_query_sql(query, columns):
-    # get the table
-    # get filters
-    # get ordering or aggregation
+def get_query_expr(query, columns, tables):
+    node_list = get_node_list(query)
+    base_table, filters, row_selector = node_list[0], node_list[1:-1], node_list[-1]
+    assert isinstance(base_table, BaseTable)
+    assert all(isinstance(f, FilteredTable) for f in filters)
+    assert isinstance(row_selector, (Row, ValueFromAggregate))
+    query = _get_query_expr(base_table.name, columns, filters, tables)
+    query = apply_row_selector(query, row_selector)
+    return query
+
+
+def _get_query_expr(table_name, columns, filters, tables):
+    columns = ["patient_id"] + list(columns)
+    table_expr = get_table_expression(table_name)
+    column_objs = [table_expr.c[column] for column in columns]
+    query = sqlalchemy.select(column_objs).select_from(table_expr)
+    for query_filter in filters:
+        query = apply_filter(query, query_filter, tables)
+    return query
+
+
+def get_node_list(query):
     node_list = []
     node = query
     while True:
@@ -88,71 +132,76 @@ def get_query_sql(query, columns):
         else:
             node = node.source
     node_list.reverse()
-    table = node_list[0].name
-    filters = [node for node in node_list if type(node) is FilteredTable]
-    aggregations = []
-    orderings = [node for node in node_list if type(node) is RowFromOrderBy]
-    assert len(orderings) <= 1
-    ordering = orderings[0] if orderings else None
-    return build_sql(table, columns, filters, aggregations, ordering)
+    return node_list
 
 
-def build_sql(table, columns, filters=(), aggregations=(), ordering=None):
-    # Build a set listing every column we'll need to touch from `table` to
-    # build this query
-    columns = ["patient_id"] + list(columns)
-    all_columns = get_column_references(columns, filters, aggregations, ordering)
-    table_expr = get_table_expression(table, all_columns)
-    column_objs = [table_expr.c[column] for column in columns]
-    query = sqlalchemy.select(column_objs).select_from(table_expr)
-    for query_filter in filters:
-        query = apply_filter(query, query_filter)
-    if ordering:
-        order_columns = [table_expr.c[column] for column in ordering.sort_columns]
-        if ordering.descending:
-            order_columns = [c.desc() for c in order_columns]
-        row_num = (
-            sqlalchemy.func.row_number()
-            .over(order_by=order_columns, partition_by=table_expr.c.patient_id)
-            .label("_row_num")
-        )
-        query = query.add_columns(row_num)
-        subquery = query.alias()
-        query = sqlalchemy.select([subquery.c[column] for column in columns])
-        query = query.select_from(subquery).where(subquery.c._row_num == 1)
-    return str(query.compile(compile_kwargs={"literal_binds": True}))
+def apply_row_selector(query, row_selector):
+    if isinstance(row_selector, Row):
+        return apply_row_from_order_by(query, sort_columns=row_selector.sort_columns, descending=row_selector.descending)
+    elif isinstance(row_selector, ValueFromAggregate):
+        return apply_row_from_aggregate(query, function_name=row_selector.function, column=row_selector.column)
+    else:
+        raise NotImplementedError(f"{row_selector} not handled yet")
 
 
-def get_column_references(columns, filters, aggregations, ordering):
-    all_columns = set(columns)
-    for filter in filters:
-        all_columns.add(filter.column)
-    return all_columns
-
-
-def apply_filter(query, query_filter):
+def apply_row_from_order_by(query, sort_columns, descending):
     table_expr = get_primary_table_expr(query)
+    column_names = [column.name for column in query.selected_columns]
+    order_columns = [table_expr.c[column] for column in sort_columns]
+    if descending:
+        order_columns = [c.desc() for c in order_columns]
+    row_num = (
+        sqlalchemy.func.row_number()
+        .over(order_by=order_columns, partition_by=table_expr.c.patient_id)
+        .label("_row_num")
+    )
+    query = query.add_columns(row_num)
+    subquery = query.alias()
+    query = sqlalchemy.select([subquery.c[column] for column in column_names])
+    query = query.select_from(subquery).where(subquery.c._row_num == 1)
+    return query
+
+
+def apply_row_from_aggregate(query, function_name, column):
+    #table_expr = get_primary_table_expr(query)
+    function = getattr(sqlalchemy.func, function_name)
+    query = query.with_only_columns([query.selected_columns.patient_id, function(query.selected_columns[column]).label("value")])
+    query = query.group_by(query.selected_columns.patient_id)
+    return query
+
+
+def apply_filter(query, query_filter, tables):
     column_name = query_filter.column
     operator = query_filter.operator
-    value = query_filter.value
-    if isinstance(value, QueryNode):
-        other_table = table_names[value.source]
-        column = value.column
-        value = sqlalchemy.literal_column(f"{other_table}.{column}")
-        query = include_joined_table(query, get_plain_table_expression(other_table, ()))
+    value, other_table = get_value_expr(query_filter.value, tables)
+    if other_table is not None:
+        query = include_joined_table(query, other_table)
+    table_expr = get_primary_table_expr(query)
     column = table_expr.c[column_name]
     method = getattr(column, operator)
     return query.where(method(value))
 
 
+def get_value_expr(value, tables):
+    if isinstance(value, (ValueFromRow, Column)):
+        other_table = tables[value.source]
+        value_expr = other_table.c[value.column]
+        return value_expr, other_table
+    elif isinstance(value, ValueFromAggregate):
+        other_table = tables[value]
+        value_expr = other_table.c.value
+        return value_expr, other_table
+    else:
+        return value, None
+
+
 def include_joined_table(query, table_expr):
     if table_expr.name in [t.name for t in get_joined_tables(query)]:
         return query
-    main_table_expr = get_primary_table_expr(query)
     join = sqlalchemy.join(
         query.froms[0],
         table_expr,
-        main_table_expr.c.patient_id == table_expr.c.patient_id,
+        query.selected_columns.patient_id == table_expr.c.patient_id,
         isouter=True,
     )
     return query.select_from(join)
@@ -160,7 +209,7 @@ def include_joined_table(query, table_expr):
 
 def get_joined_tables(query):
     tables = []
-    from_exprs = list(query.froms)
+    from_exprs = [query.froms[0]]
     while from_exprs:
         next_expr = from_exprs.pop()
         if isinstance(next_expr, sqlalchemy.sql.selectable.Join):
@@ -174,28 +223,25 @@ def get_primary_table_expr(query):
     return get_joined_tables(query)[-1]
 
 
-def get_table_expression(table_name, fields):
-    if table_name != "sgss_sars_cov_2":
-        return get_plain_table_expression(table_name, fields)
-    else:
+def get_table_expression(table_name):
+    if table_name == "clinical_events":
+        return get_sqlalchemy_table(table_name, ["code", "date", "numeric_value"])
+    if table_name == "practice_registrations":
+        return get_sqlalchemy_table(
+            table_name, ["date_start", "date_end", "stp_code"]
+        )
+    elif table_name == "sgss_sars_cov_2":
         return get_subquery_expression(
             table_name,
-            fields,
+            ["date", "positive_result"],
             """
             SELECT patient_id, date, True AS positive FROM sgss_positive
             UNION ALL
             SELECT patient_id, date, False AS positive FROM sgss_negative
             """,
         )
-
-
-def get_plain_table_expression(table_name, fields):
-    return sqlalchemy.Table(
-        table_name,
-        sqlalchemy.MetaData(),
-        sqlalchemy.Column("patient_id"),
-        *[sqlalchemy.Column(field) for field in fields],
-    )
+    else:
+        raise ValueError(f"Unknown table '{table_name}'")
 
 
 def get_subquery_expression(table_name, fields, query):
@@ -206,26 +252,6 @@ def get_subquery_expression(table_name, fields, query):
     )
     table = table.alias(table_name)
     return table
-
-
-def get_filtered_table_expr(table_expr, output_columns, filters):
-    joins_needed = {}
-    for filter in filters:
-        for other_table_expr, needs_outer_join in get_joins_from_filter(filter):
-            needs_outer_join |= joins_needed.get(other_table_expr, False)
-            joins_needed[other_table_expr] = needs_outer_join
-    join_expr = table_expr
-    for other_table_expr, needs_outer_join in joins_needed.items():
-        join_expr = join_expr.join(
-            other_table_expr,
-            table_expr.c.patient_id == other_table_expr.c.patient_id,
-            isouter=needs_outer_join,
-        )
-    column_exprs = [table_expr.c[column] for column in output_columns]
-    query = sqlalchemy.select(column_exprs).select_from(join_expr)
-    for filter in filters:
-        query = apply_filter(query, filter)
-    return query
 
 
 if __name__ == "__main__":

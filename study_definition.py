@@ -4,6 +4,7 @@ creatinine_codes = codelist(["XE2q5"], system="ctv3")
 
 
 class Cohort:
+
     _sgss_positives = table("sgss_sars_cov_2").filter(positive_result=True)
     sgss_first_positive_test_date = _sgss_positives.earliest().get("date")
     sgss_last_positive_test_date = _sgss_positives.latest().get("date")
@@ -29,3 +30,5 @@ class Cohort:
         .active_as_of(sgss_first_positive_test_date)
         .get("stp_code")
     )
+
+    population = table("practice_registrations").exists()

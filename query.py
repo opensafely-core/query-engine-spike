@@ -57,11 +57,11 @@ class BaseTable(QueryNode):
 
     def first_by(self, *columns):
         assert columns
-        return RowFromOrderBy(source=self, sort_columns=columns, descending=True)
+        return Row(source=self, sort_columns=columns, descending=True)
 
     def last_by(self, *columns):
         assert columns
-        return RowFromOrderBy(source=self, sort_columns=columns, descending=False)
+        return Row(source=self, sort_columns=columns, descending=False)
 
     def active_as_of(self, date):
         return (
@@ -71,10 +71,13 @@ class BaseTable(QueryNode):
         )
 
     def count(self):
-        return self.aggregate("COUNT", "*")
+        return self.aggregate("count", "patient_id")
+
+    def exists(self):
+        return self.aggregate("exists", "patient_id")
 
     def aggregate(self, function, column):
-        return RowFromAggregate(self, function, column)
+        return ValueFromAggregate(self, function, column)
 
 
 class FilteredTable(BaseTable):
@@ -86,22 +89,13 @@ class FilteredTable(BaseTable):
 
 
 class Row(QueryNode):
-    def get(self, column):
-        return Value(source=self, column=column)
-
-
-class RowFromOrderBy(Row):
     def __init__(self, source, sort_columns, descending=False):
         self.source = source
         self.sort_columns = sort_columns
         self.descending = descending
 
-
-class RowFromAggregate(Row):
-    def __init__(self, source, function, column):
-        self.source = source
-        self.function = function
-        self.column = column
+    def get(self, column):
+        return ValueFromRow(source=self, column=column)
 
 
 class Column(QueryNode):
@@ -111,6 +105,17 @@ class Column(QueryNode):
 
 
 class Value(QueryNode):
+    pass
+
+
+class ValueFromRow(Value):
     def __init__(self, source, column):
         self.source = source
+        self.column = column
+
+
+class ValueFromAggregate(Value):
+    def __init__(self, source, function, column):
+        self.source = source
+        self.function = function
         self.column = column
