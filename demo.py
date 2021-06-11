@@ -4,6 +4,7 @@ import sqlalchemy
 
 from query import (
     QueryNode,
+    Value,
     ValueFromRow,
     ValueFromAggregate,
     Column,
@@ -11,16 +12,6 @@ from query import (
     FilteredTable,
     Row,
 )
-
-
-def _next_table_name():
-    n = 0
-    while True:
-        n += 1
-        yield f"#table_{n}"
-
-
-table_names = defaultdict(_next_table_name().__next__)
 
 
 def main():
@@ -34,31 +25,43 @@ def main():
 
 
 def build_queries(cohort):
-    queries = get_queries(cohort.values())
+    query_groups = get_query_groups(cohort.values())
     tables = {}
-    for n, (query, columns) in enumerate(queries.items()):
-        if isinstance(query, ValueFromAggregate):
-            columns = {"value"}
+    n = 0
+    for group, outputs in query_groups.items():
+        n += 1
         table_name = f"#table_{n}"
+        columns = {get_output_column_name(output) for output in outputs}
         table = get_sqlalchemy_table(table_name, columns)
-        tables[query] = table
+        tables[group] = table
     sql = []
-    for query, columns in queries.items():
-        query_expr = get_query_expr(query, columns, tables)
+    for group, outputs in query_groups.items():
+        query_expr = get_query_expr(group, outputs, tables)
         query_sql = query_to_sql(query_expr)
-        temp_table = tables[query].name
-        sql.append(
-            f"SELECT * INTO {temp_table} FROM (\n{query_sql}\n) t"
-        )
+        temp_table = tables[group].name
+        sql.append(f"SELECT * INTO {temp_table} FROM (\n{query_sql}\n) t")
     population = cohort.pop("population")
     column, table = get_value_expr(population, tables)
-    query = sqlalchemy.select([table.c.patient_id.label("patient_id")]).select_from(table).where(column == True)
+    query = (
+        sqlalchemy.select([table.c.patient_id.label("patient_id")])
+        .select_from(table)
+        .where(column == True)
+    )
     for column_name, node in cohort.items():
         column, table = get_value_expr(node, tables)
         query = include_joined_table(query, table)
         query = query.add_columns(column.label(column_name))
     sql.append(query_to_sql(query))
     return sql
+
+
+def get_output_column_name(node):
+    if isinstance(node, ValueFromAggregate):
+        return f"{node.column}_{node.function}"
+    elif isinstance(node, (ValueFromRow, Column)):
+        return node.column
+    else:
+        raise TypeError(f"Unhandled type: {node}")
 
 
 def query_to_sql(query):
@@ -79,14 +82,20 @@ def get_class_vars(cls):
     return [(key, value) for key, value in vars(cls).items() if key not in default_vars]
 
 
-def get_queries(leaf_nodes):
-    queries = defaultdict(set)
+def get_query_groups(leaf_nodes):
+    groups = defaultdict(list)
     for node in walk_tree(leaf_nodes):
-        if isinstance(node, (ValueFromRow, Column)):
-            queries[node.source].add(node.column)
-        elif isinstance(node, ValueFromAggregate):
-            queries[node].add(node.column)
-    return queries
+        group = get_query_group(node)
+        if group is not None:
+            groups[group].append(node)
+    return groups
+
+
+def get_query_group(node):
+    if isinstance(node, (Value, Column)):
+        return (type(node), node.source)
+    else:
+        return None
 
 
 def walk_tree(nodes):
@@ -101,19 +110,37 @@ def walk_tree(nodes):
         yield from walk_tree(parents)
 
 
-def get_query_expr(query, columns, tables):
+def get_query_expr(group, outputs, tables):
+    output_type, query = group
+
     node_list = get_node_list(query)
-    base_table, filters, row_selector = node_list[0], node_list[1:-1], node_list[-1]
+    base_table = node_list.pop(0)
     assert isinstance(base_table, BaseTable)
+    row_selector = None
+    if issubclass(output_type, ValueFromRow):
+        row_selector = node_list.pop()
+        assert isinstance(row_selector, Row)
+    # Remaining nodes should be filters
+    filters = node_list
     assert all(isinstance(f, FilteredTable) for f in filters)
-    assert isinstance(row_selector, (Row, ValueFromAggregate))
-    query = _get_query_expr(base_table.name, columns, filters, tables)
-    query = apply_row_selector(query, row_selector)
+
+    columns = {node.column for node in outputs}
+    query = get_filtered_table_expr(base_table.name, columns, filters, tables)
+    if row_selector is not None:
+        query = apply_row_from_order_by(
+            query,
+            sort_columns=row_selector.sort_columns,
+            descending=row_selector.descending,
+        )
+
+    if issubclass(output_type, ValueFromAggregate):
+        query = apply_aggregates(query, outputs)
+
     return query
 
 
-def _get_query_expr(table_name, columns, filters, tables):
-    columns = ["patient_id"] + list(columns)
+def get_filtered_table_expr(table_name, columns, filters, tables):
+    columns = {"patient_id"}.union(columns)
     table_expr = get_table_expression(table_name)
     column_objs = [table_expr.c[column] for column in columns]
     query = sqlalchemy.select(column_objs).select_from(table_expr)
@@ -135,15 +162,6 @@ def get_node_list(query):
     return node_list
 
 
-def apply_row_selector(query, row_selector):
-    if isinstance(row_selector, Row):
-        return apply_row_from_order_by(query, sort_columns=row_selector.sort_columns, descending=row_selector.descending)
-    elif isinstance(row_selector, ValueFromAggregate):
-        return apply_row_from_aggregate(query, function_name=row_selector.function, column=row_selector.column)
-    else:
-        raise NotImplementedError(f"{row_selector} not handled yet")
-
-
 def apply_row_from_order_by(query, sort_columns, descending):
     table_expr = get_primary_table_expr(query)
     column_names = [column.name for column in query.selected_columns]
@@ -162,12 +180,21 @@ def apply_row_from_order_by(query, sort_columns, descending):
     return query
 
 
-def apply_row_from_aggregate(query, function_name, column):
-    #table_expr = get_primary_table_expr(query)
-    function = getattr(sqlalchemy.func, function_name)
-    query = query.with_only_columns([query.selected_columns.patient_id, function(query.selected_columns[column]).label("value")])
+def apply_aggregates(query, aggregates):
+    columns = [get_aggregate_column(query, aggregate) for aggregate in aggregates]
+    query = query.with_only_columns([query.selected_columns.patient_id] + columns)
     query = query.group_by(query.selected_columns.patient_id)
     return query
+
+
+def get_aggregate_column(query, aggregate):
+    output_column = get_output_column_name(aggregate)
+    if aggregate.function == "exists":
+        return sqlalchemy.literal(True).label(output_column)
+    else:
+        function = getattr(sqlalchemy.func, aggregate.function)
+        source_column = aggregate.column
+        return function(query.selected_columns[source_column]).label(output_column)
 
 
 def apply_filter(query, query_filter, tables):
@@ -183,14 +210,12 @@ def apply_filter(query, query_filter, tables):
 
 
 def get_value_expr(value, tables):
-    if isinstance(value, (ValueFromRow, Column)):
-        other_table = tables[value.source]
-        value_expr = other_table.c[value.column]
-        return value_expr, other_table
-    elif isinstance(value, ValueFromAggregate):
-        other_table = tables[value]
-        value_expr = other_table.c.value
-        return value_expr, other_table
+    query_group = get_query_group(value)
+    if query_group is not None:
+        table = tables[query_group]
+        column = get_output_column_name(value)
+        value_expr = table.c[column]
+        return value_expr, table
     else:
         return value, None
 
@@ -227,9 +252,7 @@ def get_table_expression(table_name):
     if table_name == "clinical_events":
         return get_sqlalchemy_table(table_name, ["code", "date", "numeric_value"])
     if table_name == "practice_registrations":
-        return get_sqlalchemy_table(
-            table_name, ["date_start", "date_end", "stp_code"]
-        )
+        return get_sqlalchemy_table(table_name, ["date_start", "date_end", "stp_code"])
     elif table_name == "sgss_sars_cov_2":
         return get_subquery_expression(
             table_name,
