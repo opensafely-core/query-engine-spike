@@ -41,11 +41,11 @@ def build_queries(cohort):
         temp_table = tables[group].name
         sql.append(f"SELECT * INTO {temp_table} FROM (\n{query_sql}\n) t")
     population = cohort.pop("population")
-    column, table = get_value_expr(population, tables)
+    is_included, population_table = get_value_expr(population, tables)
     query = (
-        sqlalchemy.select([table.c.patient_id.label("patient_id")])
-        .select_from(table)
-        .where(column == True)
+        sqlalchemy.select([population_table.c.patient_id.label("patient_id")])
+        .select_from(population_table)
+        .where(is_included == True)
     )
     for column_name, node in cohort.items():
         column, table = get_value_expr(node, tables)
