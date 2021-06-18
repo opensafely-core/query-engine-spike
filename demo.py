@@ -2,6 +2,8 @@ from collections import defaultdict
 
 import sqlalchemy
 
+from cohortextractor.sqlalchemy_utils import make_table_expression, get_joined_tables
+
 from query import (
     QueryNode,
     Value,
@@ -27,9 +29,13 @@ def main():
 class DatabaseDefinition:
     def get_table_expression(self, table_name):
         if table_name == "clinical_events":
-            return get_sqlalchemy_table(table_name, ["code", "date", "numeric_value"])
+            return make_table_expression(
+                table_name, ["patient_id", "code", "date", "numeric_value"]
+            )
         if table_name == "practice_registrations":
-            return get_sqlalchemy_table(table_name, ["date_start", "date_end", "stp_code"])
+            return make_table_expression(
+                table_name, ["patient_id", "date_start", "date_end", "stp_code"]
+            )
         elif table_name == "sgss_sars_cov_2":
             return self.get_subquery_expression(
                 table_name,
@@ -51,8 +57,6 @@ class DatabaseDefinition:
         )
         table = table.alias(table_name)
         return table
-
-
 
 
 class QueryEngine:
@@ -83,7 +87,9 @@ class QueryEngine:
         for group, output_nodes in output_groups.items():
             table_name = self.get_new_temporary_table_name()
             columns = {self.get_output_column_name(output) for output in output_nodes}
-            self.temp_tables[group] = get_sqlalchemy_table(table_name, columns)
+            self.temp_tables[group] = make_table_expression(
+                table_name, {"patient_id"} | columns
+            )
 
         # For each group of output nodes, build a SQLAlchemy query expression
         # to populate the associated temporary table
@@ -289,26 +295,13 @@ class QueryEngine:
         return str(query.compile(compile_kwargs={"literal_binds": True}))
 
 
-
-
 def query_to_sql(query):
     return str(query.compile(compile_kwargs={"literal_binds": True}))
-
-
-def get_sqlalchemy_table(table_name, columns):
-    return sqlalchemy.Table(
-        table_name,
-        sqlalchemy.MetaData(),
-        sqlalchemy.Column("patient_id"),
-        *[sqlalchemy.Column(column) for column in columns],
-    )
 
 
 def get_class_vars(cls):
     default_vars = set(dir(type("ArbitraryEmptyClass", (), {})))
     return [(key, value) for key, value in vars(cls).items() if key not in default_vars]
-
-
 
 
 def include_joined_table(query, table_expr):
@@ -323,26 +316,12 @@ def include_joined_table(query, table_expr):
     return query.select_from(join)
 
 
-def get_joined_tables(query):
-    tables = []
-    from_exprs = [query.froms[0]]
-    while from_exprs:
-        next_expr = from_exprs.pop()
-        if isinstance(next_expr, sqlalchemy.sql.selectable.Join):
-            from_exprs.extend([next_expr.left, next_expr.right])
-        else:
-            tables.append(next_expr)
-    return tables
-
-
 def get_primary_table_expression(query):
     return get_joined_tables(query)[-1]
 
 
 def get_primary_table_expr(query):
     return get_joined_tables(query)[-1]
-
-
 
 
 if __name__ == "__main__":
