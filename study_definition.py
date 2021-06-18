@@ -1,4 +1,4 @@
-from query import table, codelist
+from cohortextractor import table, codelist
 
 creatinine_codes = codelist(["XE2q5"], system="ctv3")
 
