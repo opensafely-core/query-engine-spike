@@ -1,44 +1,41 @@
-import sqlalchemy
-
 from cohortextractor.query_engines import mssql
-from cohortextractor.sqlalchemy_utils import make_table_expression
+
+from .base import BackendBase, Table, Column
 
 
-class Backend:
+class Backend(BackendBase):
 
     query_engine_class = mssql.QueryEngine
 
-    @classmethod
-    def get_query_engine(cls, column_definitions):
-        return cls.query_engine_class(column_definitions, backend=cls())
+    clinical_events = Table(
+        source="CodedEvents",
+        columns=dict(
+            code=Column("code", system="ctv3", source="CTV3Code"),
+            date=Column("datetime", source="ConsultationDate"),
+            numeric_value=Column("float", source="NumericValue"),
+        ),
+    )
 
-    def get_table_expression(self, table_name):
-        if table_name == "clinical_events":
-            return make_table_expression(
-                table_name, ["patient_id", "code", "date", "numeric_value"]
-            )
-        if table_name == "practice_registrations":
-            return make_table_expression(
-                table_name, ["patient_id", "date_start", "date_end", "stp_code"]
-            )
-        elif table_name == "sgss_sars_cov_2":
-            return self.get_subquery_expression(
-                table_name,
-                ["date", "positive_result"],
-                """
-                SELECT patient_id, date, True AS positive FROM sgss_positive
-                UNION ALL
-                SELECT patient_id, date, False AS positive FROM sgss_negative
-                """,
-            )
-        else:
-            raise ValueError(f"Unknown table '{table_name}'")
-
-    def get_subquery_expression(self, table_name, fields, query):
-        table = sqlalchemy.text(query)
-        table = table.columns(
-            sqlalchemy.literal_column("patient_id"),
-            *[sqlalchemy.literal_column(field) for field in fields],
+    sgss_sars_cov_2 = Table(
+        columns=dict(
+            date=Column("date"),
+            positive_result=Column("boolean"),
         )
-        table = table.alias(table_name)
-        return table
+    )
+
+    @sgss_sars_cov_2.query
+    def sgss_sars_cov_2_query():
+        return """
+        SELECT patient_id, date, True AS positive_result FROM sgss_positive
+        UNION ALL
+        SELECT patient_id, date, False AS positive_result FROM sgss_negative
+        """
+
+    practice_registrations = Table(
+        source="RegistrationHistory",
+        columns=dict(
+            date_start=Column("date", source="StartDate"),
+            date_end=Column("date", source="EndDate"),
+            stp_code=Column("categorical", source="STPCode"),
+        ),
+    )
