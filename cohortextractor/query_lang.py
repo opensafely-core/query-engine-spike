@@ -1,3 +1,6 @@
+__all__ = ["table", "codelist"]
+
+
 def table(table_name):
     return BaseTable(table_name)
 
@@ -7,7 +10,15 @@ def codelist(*args, **kwargs):
 
 
 class QueryNode:
-    pass
+    def to_dict(self):
+        return vars(self)
+
+    @classmethod
+    def from_dict(cls, dictionary):
+        obj = cls.__new__(cls)
+        for key, value in dictionary.items():
+            setattr(obj, key, value)
+        return obj
 
 
 class BaseTable(QueryNode):

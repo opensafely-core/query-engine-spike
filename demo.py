@@ -1,19 +1,21 @@
 from cohortextractor.backends.tpp import Backend
+from cohortextractor.serialization import (
+    cohort_class_to_definition,
+    cohort_definition_to_dict,
+    cohort_definition_from_dict,
+)
 
 
 def main():
     from study_definition import Cohort
 
-    cohort = {
-        key: value for key, value in get_class_vars(Cohort) if not key.startswith("_")
-    }
-    query_engine = Backend.get_query_engine(cohort)
+    cohort_definition = cohort_class_to_definition(Cohort)
+    # Test roundtrip
+    cohort_definition = cohort_definition_from_dict(
+        cohort_definition_to_dict(cohort_definition)
+    )
+    query_engine = Backend.get_query_engine(cohort_definition)
     print(query_engine.get_sql())
-
-
-def get_class_vars(cls):
-    default_vars = set(dir(type("ArbitraryEmptyClass", (), {})))
-    return [(key, value) for key, value in vars(cls).items() if key not in default_vars]
 
 
 if __name__ == "__main__":
